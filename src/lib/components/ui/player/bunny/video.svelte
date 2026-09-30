@@ -114,6 +114,8 @@
 
   export let audioTracks: Track[] = []
   export let videoTracks: Track[] = []
+  // the audio track to start on (a container track id), set when playback switched to this player for a specific pick
+  export let preferredAudioId: string | undefined = undefined
 
   export let canvasSource: CanvasImageSource
   export let current: MediaInfo
@@ -319,7 +321,7 @@
 
     const tracks = [...playbackVideoTracks, ...playbackAudioTracks]
 
-    selectedAudioId ??= (playbackAudioTracks.find(track => track.languageCode === $settings.audioLanguage) ?? playbackAudioTracks.find(track => track.languageCode === 'jpn'))?.id.toString()
+    selectedAudioId ??= (playbackAudioTracks.find(track => `${track.id}` === preferredAudioId) ?? playbackAudioTracks.find(track => track.languageCode === $settings.audioLanguage) ?? playbackAudioTracks.find(track => track.languageCode === 'jpn'))?.id.toString()
 
     audioTracks = playbackAudioTracks.map(t => new DummyTrack(t))
     videoTracks = playbackVideoTracks.map(t => new DummyTrack(t))
