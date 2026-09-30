@@ -27,6 +27,7 @@
   import ProgressButton from '../button/progress-button.svelte'
 
   import Animations, { playAnimation } from './animations.svelte'
+  import { preferredAudioTrack, probeContainerAudio, type ContainerAudioTrack } from './audio-tracks'
   import { activeDisplay, displays } from './castplayer.svelte'
   import Chapters, { findChapter, getChapterTitle, type Chapter } from './chapters'
   import DownloadStats from './downloadstats.svelte'
@@ -130,6 +131,16 @@
   }
 
   let useMediaBunnyPlayback = $settings.playerCustom || dev
+  // Set once the custom player has failed on this file, so a codec gap never bounces playback between the two players.
+  let customPlayerFailed = false
+  // The container track the custom player starts on when playback switches to it for a specific pick.
+  let requestedAudioId: string | undefined
+  // Every audio track the file carries, read from the container, with whether the native element can decode it.
+  let containerAudio: ContainerAudioTrack[] = []
+  // Tracks the native player cannot decode, offered in the menu; picking one switches to the custom player.
+  $: extraAudioTracks = useMediaBunnyPlayback
+    ? []
+    : containerAudio.filter(track => !track.native).map(track => ({ id: `custom:${track.id}`, kind: 'audio', label: `${track.label} (custom player)`, language: track.language, enabled: false, selected: false }))
 
   let subtitles: Subs | undefined
   let deband: VideoDeband | undefined
@@ -154,9 +165,19 @@
 
   function handleMediaBunnyFallback ({ detail }: CustomEvent<Error>) {
     useMediaBunnyPlayback = false
-    toast.error('Mobile playback setup failed', {
-      description: detail.message || 'Falling back to native playback for this file.', duration: 15_000
+    customPlayerFailed = true
+    requestedAudioId = undefined
+    toast.error('Custom player failed', {
+      description: detail.message || 'Falling back to the native player for this file.', duration: 15_000
     })
+  }
+
+  // Playback moves to the custom player, which decodes every audio codec the file can carry, keeping
+  // the current position. `audioId` is the container track to start on.
+  function switchToCustomPlayer (audioId: string | undefined, why: string) {
+    requestedAudioId = audioId
+    useMediaBunnyPlayback = true
+    toast.info('Using the custom player', { description: why, duration: 8_000 })
   }
 
   $: if (subtitles?.jassub) subtitles.jassub.timeOffset = Number(subtitleDelay)
@@ -222,28 +243,55 @@
     if (!document.fullscreenElement && SUPPORTS.isAndroid && !isMiniplayer) history.back()
   }
 
-  function checkAudio () {
-    if (video.audioTracks) {
-      if (!video.audioTracks.length) {
-        toast.error('Audio Codec Unsupported', {
-          description: "This torrent's audio codec is not supported, try a different release by disabling Autoplay Torrents in Torrent settings. You can also use external players like MPV.",
-          duration: 15_000
-        })
-      } else if (video.audioTracks.length > 1) {
-        const preferredTrack = [...video.audioTracks].find(({ language }) => language === $settings.audioLanguage)
-        if (preferredTrack) return selectAudio(preferredTrack.id)
-
-        const japaneseTrack = [...video.audioTracks].find(({ language }) => language === 'jpn')
-        if (japaneseTrack) return selectAudio(japaneseTrack.id)
+  function unsupportedAudio () {
+    toast.error('Audio Codec Unsupported', {
+      description: "This torrent's audio codec is not supported, try a different release by disabling Autoplay Torrents in Torrent settings. You can also use external players like MPV.",
+      duration: 15_000
+    })
+  }
+  // Puts playback on the preferred language among the tracks the current player lists.
+  function selectPreferredAudio () {
+    if (!video.audioTracks || video.audioTracks.length < 2) return
+    const preferred = preferredAudioTrack([...video.audioTracks], $settings.audioLanguage)
+    if (preferred) selectAudio(preferred.id)
+  }
+  async function checkAudio () {
+    if (useMediaBunnyPlayback) {
+      // the custom player lists every track the file carries and decodes all of them
+      if (!video.audioTracks?.length) return unsupportedAudio()
+      if (requestedAudioId) {
+        // the pick that brought us here is already the custom player's starting track
+        requestedAudioId = undefined
+        return
       }
+      return selectPreferredAudio()
+    }
+
+    // The native element only lists the tracks Chromium can decode, so the file's own track list is
+    // the reference: when the track we want is one Chromium dropped, the custom player takes over.
+    const element = video as unknown as HTMLVideoElement
+    try {
+      containerAudio = await probeContainerAudio(mediaInfo.file.url)
+    } catch (err) {
+      console.error('Could not read the audio tracks from the file, using what the native player reports:', err)
+      containerAudio = []
+    }
+    if (element !== (video as unknown) || useMediaBunnyPlayback) return // the file or the player changed while the probe ran
+
+    const wanted = preferredAudioTrack(containerAudio, $settings.audioLanguage)
+    if (wanted && !wanted.native && !customPlayerFailed) {
+      return switchToCustomPlayer(wanted.id, `${wanted.label} is ${wanted.codec?.toUpperCase() ?? 'a codec'} the native player cannot decode.`)
+    }
+
+    if (video.audioTracks) {
+      if (!video.audioTracks.length) return unsupportedAudio()
+      selectPreferredAudio()
     } else {
       video.requestVideoFrameCallback(() => {
         // using capturestream.getAudioTracks() could work too
         if ('webkitAudioDecodedByteCount' in video && video.webkitAudioDecodedByteCount === 0) {
-          toast.error('Audio Codec Unsupported', {
-            description: "This torrent's audio codec is not supported, try a different release by disabling Autoplay Torrents in Torrent settings. You can also use external players like MPV.",
-            duration: 15_000
-          })
+          if (containerAudio.length && !customPlayerFailed) return switchToCustomPlayer(wanted?.id, 'The native player decoded no audio for this file.')
+          unsupportedAudio()
         }
       })
     }
@@ -253,15 +301,19 @@
     $volume = Math.min(1, Math.max(0, $volume + delta))
   }
   function selectAudio (id: string) {
-    if (id) {
-      for (const track of video.audioTracks ?? []) {
-        track.enabled = track.id === id
-        if (track.id === id) playAnimation(track.label)
-      }
-
-      if (useMediaBunnyPlayback) return
-      seek(-0.2) // stupid fix because video freezes up when chaging tracks
+    if (!id) return
+    if (id.startsWith('custom:')) {
+      // a track the native player cannot decode, offered in the menu from the container's list
+      const track = containerAudio.find(track => `custom:${track.id}` === id)
+      return switchToCustomPlayer(id.slice('custom:'.length), `${track?.label ?? 'That track'} needs the custom player.`)
     }
+    for (const track of video.audioTracks ?? []) {
+      track.enabled = track.id === id
+      if (track.id === id) playAnimation(track.label)
+    }
+
+    if (useMediaBunnyPlayback) return
+    seek(-0.2) // stupid fix because video freezes up when chaging tracks
   }
   function selectVideo (id: string) {
     if (id) {
@@ -792,6 +844,7 @@
         {otherFiles}
         {pip}
         current={mediaInfo}
+        preferredAudioId={requestedAudioId}
         bind:this={video}
         bind:canvasSource
         bind:videoHeight
@@ -869,7 +922,7 @@
         <StatsForNerds {subtitleDelay} {currentTime} {safeduration} {readyState} volume={$volume} {video} {buffered} {videoWidth} {videoHeight} close={() => { showStats = false }} />
       {/if}
       {#if $settings.minimalPlayerUI || (SUPPORTS.isMobile && !SUPPORTS.isAndroidTV)}
-        <Options {wrapper} bind:open bind:openPath {video} {seekTo} screenshot={ss} {selectAudio} {selectVideo} {fullscreen} chapters={$chapters} {subtitles} {videoFiles} {selectFile} {pip} bind:playbackRate={$playbackRateStore} bind:subtitleDelay
+        <Options {wrapper} bind:open bind:openPath {video} {extraAudioTracks} {seekTo} screenshot={ss} {selectAudio} {selectVideo} {fullscreen} chapters={$chapters} {subtitles} {videoFiles} {selectFile} {pip} bind:playbackRate={$playbackRateStore} bind:subtitleDelay
           class='inline-flex p-3 size-12 absolute z-[1] top-4 right-4 bg-background/20 pointer-events-auto transition-opacity desktop:select:opacity-100 {immersed && 'opacity-0'} {!pointerMoveTimeout && 'delay-150'}' />
       {/if}
       {#if fastForwarding}
@@ -957,7 +1010,7 @@
                 x{playbackRate?.toFixed(1)}
               </Button>
             {/if}
-            <Options {fullscreen} {wrapper} screenshot={ss} {seekTo} bind:open bind:openPath {video} {selectAudio} {selectVideo} chapters={$chapters} {subtitles} {videoFiles} {selectFile} {pip} bind:playbackRate={$playbackRateStore} bind:subtitleDelay />
+            <Options {fullscreen} {wrapper} screenshot={ss} {seekTo} bind:open bind:openPath {video} {extraAudioTracks} {selectAudio} {selectVideo} chapters={$chapters} {subtitles} {videoFiles} {selectFile} {pip} bind:playbackRate={$playbackRateStore} bind:subtitleDelay />
             {#if $w2globby}
               <Button class='p-3 size-12 relative shrink-0 animated-icon' variant='ghost' on:click={() => { chatOpen = !chatOpen }} on:keydown={keywrap(() => { chatOpen = !chatOpen })}>
                 <Messages size={24} />

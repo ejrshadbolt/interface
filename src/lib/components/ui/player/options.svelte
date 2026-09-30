@@ -12,6 +12,7 @@
   import type PictureInPicture from './pip'
   import type { ResolvedFile } from './resolver'
   import type Subtitles from './subtitles'
+  import type { Track } from '../../../../app'
   import type { Writable } from 'simple-store-svelte'
   import type { HTMLAttributes } from 'svelte/elements'
 
@@ -26,6 +27,8 @@
   export let wrapper: HTMLDivElement
 
   export let video: Pick<HTMLMediaElement, 'audioTracks' | 'videoTracks'>
+  // audio tracks the file carries that the current player cannot decode; picking one switches player
+  export let extraAudioTracks: Track[] = []
 
   export let selectAudio: (id: string) => void
   export let selectVideo: (id: string) => void
@@ -103,11 +106,11 @@
         </Keybinds>
       {:else}
         <Tree.Root bind:state={treeState}>
-          {#if video.audioTracks?.length}
+          {#if video.audioTracks?.length || extraAudioTracks.length}
             <Tree.Item>
               <span slot='trigger'>Audio</span>
               <Tree.Sub>
-                {#each Object.entries(normalizeTracks(video.audioTracks ?? [])) as [lang, tracks] (lang)}
+                {#each Object.entries(normalizeTracks([...(video.audioTracks ?? []), ...extraAudioTracks])) as [lang, tracks] (lang)}
                   <Tree.Item>
                     <span slot='trigger' class='capitalize'>{lang}</span>
                     <Tree.Sub>
